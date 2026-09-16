@@ -3,6 +3,7 @@ import re
 import json
 import asyncio
 from datetime import datetime, date, timedelta, time
+from zoneinfo import ZoneInfo
 import aiohttp
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -15,6 +16,9 @@ from aiogram.types import (
 )
 
 TOKEN = ("8703800816:AAH5c8PSbXalv_1HmJ7gx8quwCCKnxKRyrk")
+
+# Фіксація часового поясу Києва для коректної роботи на серверах у будь-якій країні
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
 MAIN_API_URL = "https://rozklad.nubip.edu.ua/api/public/schedule/VETM/3-10"
 ELECTIVE_API_URL = "https://rozklad.nubip.edu.ua/api/public/schedule/ADDT/0-8"
@@ -127,10 +131,8 @@ async def fetch_site_week_parity(session: aiohttp.ClientSession) -> str:
             if resp.status == 200:
                 html = await resp.text()
 
-                # Шукаємо активні елементи або класи для 'чисельник' / 'знаменник'
                 patterns_odd = [
                     r'(?:active|selected|current)[^>]*>[^<]*чисельник',
-                    r'чисельник[^<]*<\/(?:button|span|div|a)>(?:(?!(?:active|selected|current)).)*$',
                     r'class="[^"]*(?:active|selected)[^"]*"[^>]*>[^<]*чисельник'
                 ]
                 patterns_even = [
@@ -150,7 +152,6 @@ async def fetch_site_week_parity(session: aiohttp.ClientSession) -> str:
                         CACHED_PARITY["timestamp"] = now_ts
                         return "odd"
 
-                # Загальний пошук за першим активним маркуванням
                 lower_html = html.lower()
                 pos_odd = lower_html.find("чисельник")
                 pos_even = lower_html.find("знаменник")
@@ -165,7 +166,8 @@ async def fetch_site_week_parity(session: aiohttp.ClientSession) -> str:
     except Exception as e:
         print(f"Помилка парсингу тижня з сайту: {e}")
 
-    fallback = get_fallback_parity(datetime.now().date())
+    now_kyiv = datetime.now(KYIV_TZ).date()
+    fallback = get_fallback_parity(now_kyiv)
     CACHED_PARITY["parity"] = fallback
     CACHED_PARITY["timestamp"] = now_ts
     return fallback
@@ -315,7 +317,7 @@ async def cmd_start(msg: types.Message):
 
 @dp.message(F.text == "📍 На сьогодні")
 async def today_schedule(msg: types.Message):
-    today = datetime.now().date()
+    today = datetime.now(KYIV_TZ).date()
     async with aiohttp.ClientSession() as session:
         current_parity = await fetch_site_week_parity(session)
     current_parity_str = parity_name(current_parity)
@@ -336,7 +338,7 @@ async def today_schedule(msg: types.Message):
 
 @dp.message(F.text == "➡️ На завтра")
 async def tomorrow_schedule(msg: types.Message):
-    now_date = datetime.now().date()
+    now_date = datetime.now(KYIV_TZ).date()
     tomorrow = now_date + timedelta(days=1)
     day_idx = tomorrow.weekday()
 
@@ -353,7 +355,6 @@ async def tomorrow_schedule(msg: types.Message):
         )
         return
 
-    # Якщо завтра понеділок (новий тиждень) — інвертуємо тиждень
     tomorrow_parity = ("even" if current_parity == "odd" else "odd") if tomorrow.weekday() == 0 else current_parity
 
     slug, day_title = WEEKDAYS_MAP[day_idx]
@@ -415,16 +416,18 @@ async def notifier_loop():
 
     while True:
         try:
-            now = datetime.now()
+            # Отримуємо точний час за Києвом
+            now = datetime.now(KYIV_TZ)
             today = now.date()
             current_time = now.time()
 
             async with aiohttp.ClientSession() as session:
                 current_parity = await fetch_site_week_parity(session)
 
-            # 1. Вечірнє повідомлення на завтра о 20:00
+            # 1. Вечірнє повідомлення на завтра о 20:00 за Києвом
             if current_time.hour == 20 and current_time.minute == 0:
                 if evening_notified_date != today:
+                    # У п'ятницю (4) і суботу (5) сповіщення не надсилаються
                     if today.weekday() not in (4, 5):
                         tomorrow = today + timedelta(days=1)
                         slug, day_title = WEEKDAYS_MAP[tomorrow.weekday()]
@@ -443,10 +446,11 @@ async def notifier_loop():
                                     pass
                     evening_notified_date = today
 
+            # Скидання лічильника пар на початку нової доби за Києвом
             if current_time.hour == 0 and current_time.minute == 1:
                 notified_slots_today.clear()
 
-            # 2. Сповіщення за 20 хвилин до початку кожної пари
+            # 2. Сповіщення за 20 хвилин до початку кожної пари (пн–пт)
             if today.weekday() not in (5, 6):
                 slug, day_title = WEEKDAYS_MAP[today.weekday()]
                 _, lessons = await build_schedule_text("", slug, day_title, current_parity)
@@ -458,9 +462,11 @@ async def notifier_loop():
 
                     start_time = BELL_TIMES.get(slot, {}).get("start")
                     if start_time:
-                        lesson_dt = datetime.combine(today, start_time)
+                        # Створюємо дату початку пари з київським часовим поясом
+                        lesson_dt = datetime.combine(today, start_time, tzinfo=KYIV_TZ)
                         diff = (lesson_dt - now).total_seconds()
 
+                        # Спрацьовує за 19–20 хвилин до початку пари
                         if 1140 <= diff <= 1260:
                             time_str = BELL_TIMES[slot]["str"]
                             alert_text = (
