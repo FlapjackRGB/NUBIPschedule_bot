@@ -18,6 +18,7 @@ TOKEN = ("8703800816:AAH5c8PSbXalv_1HmJ7gx8quwCCKnxKRyrk")
 
 MAIN_API_URL = "https://rozklad.nubip.edu.ua/api/public/schedule/VETM/3-10"
 ELECTIVE_API_URL = "https://rozklad.nubip.edu.ua/api/public/schedule/ADDT/0-8"
+SITE_URL = "https://rozklad.nubip.edu.ua/"
 SUBSCRIBERS_FILE = "subscribers.json"
 
 # Пари по 80 хв (1:20), перерви по 20 хв
@@ -43,6 +44,9 @@ WEEKDAYS_MAP = {
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
+
+# Кеш для поточного тижня з сайту (оновлюється раз на 30 хвилин)
+CACHED_PARITY = {"parity": None, "timestamp": 0}
 
 # ----------------- ПІДПИСНИКИ СПОВІЩЕНЬ -----------------
 
@@ -101,7 +105,70 @@ def get_inline_week_keyboard(current_mode: str):
         ]
     )
 
-# ----------------- ПАРСИНГ ТА ЗАПИТИ ДО API -----------------
+# ----------------- ВИЗНАЧЕННЯ ТИЖНЯ ТА ПАРСИНГ -----------------
+
+def get_fallback_parity(target_date: date) -> str:
+    year = target_date.year
+    sem_start = date(year, 9, 1) if target_date.month >= 8 else date(year, 2, 1)
+    monday = sem_start - timedelta(days=sem_start.weekday())
+    week_num = ((target_date - monday).days // 7) + 1
+    return "odd" if week_num % 2 != 0 else "even"
+
+async def fetch_site_week_parity(session: aiohttp.ClientSession) -> str:
+    now_ts = asyncio.get_event_loop().time()
+    if CACHED_PARITY["parity"] and (now_ts - CACHED_PARITY["timestamp"] < 1800):
+        return CACHED_PARITY["parity"]
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    try:
+        async with session.get(SITE_URL, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            if resp.status == 200:
+                html = await resp.text()
+
+                # Шукаємо активні елементи або класи для 'чисельник' / 'знаменник'
+                patterns_odd = [
+                    r'(?:active|selected|current)[^>]*>[^<]*чисельник',
+                    r'чисельник[^<]*<\/(?:button|span|div|a)>(?:(?!(?:active|selected|current)).)*$',
+                    r'class="[^"]*(?:active|selected)[^"]*"[^>]*>[^<]*чисельник'
+                ]
+                patterns_even = [
+                    r'(?:active|selected|current)[^>]*>[^<]*знаменник',
+                    r'class="[^"]*(?:active|selected)[^"]*"[^>]*>[^<]*знаменник'
+                ]
+
+                for p in patterns_even:
+                    if re.search(p, html, re.IGNORECASE | re.DOTALL):
+                        CACHED_PARITY["parity"] = "even"
+                        CACHED_PARITY["timestamp"] = now_ts
+                        return "even"
+
+                for p in patterns_odd:
+                    if re.search(p, html, re.IGNORECASE | re.DOTALL):
+                        CACHED_PARITY["parity"] = "odd"
+                        CACHED_PARITY["timestamp"] = now_ts
+                        return "odd"
+
+                # Загальний пошук за першим активним маркуванням
+                lower_html = html.lower()
+                pos_odd = lower_html.find("чисельник")
+                pos_even = lower_html.find("знаменник")
+                if pos_odd != -1 and (pos_even == -1 or pos_odd < pos_even):
+                    CACHED_PARITY["parity"] = "odd"
+                    CACHED_PARITY["timestamp"] = now_ts
+                    return "odd"
+                elif pos_even != -1:
+                    CACHED_PARITY["parity"] = "even"
+                    CACHED_PARITY["timestamp"] = now_ts
+                    return "even"
+    except Exception as e:
+        print(f"Помилка парсингу тижня з сайту: {e}")
+
+    fallback = get_fallback_parity(datetime.now().date())
+    CACHED_PARITY["parity"] = fallback
+    CACHED_PARITY["timestamp"] = now_ts
+    return fallback
 
 def parse_electives(raw_html: str) -> list[str]:
     items = re.split(r'<br\s*/?>', raw_html)
@@ -111,10 +178,6 @@ def parse_electives(raw_html: str) -> list[str]:
         if text and text not in cleaned:
             cleaned.append(text)
     return cleaned
-
-def get_week_parity(target_date: date) -> str:
-    week_num = target_date.isocalendar()[1]
-    return "even" if week_num % 2 == 0 else "odd"
 
 def parity_name(parity_code: str) -> str:
     return "Чисельник" if parity_code == "odd" else "Знаменник"
@@ -129,13 +192,13 @@ async def fetch_json(session: aiohttp.ClientSession, url: str) -> dict:
     return {}
 
 async def build_schedule_text(group_name: str, day_slug: str, day_title: str, mode: str) -> tuple[str, list]:
-    current_parity = get_week_parity(datetime.now().date())
-    current_parity_str = parity_name(current_parity)
-    selected_parity_str = "Чисельник" if mode == "odd" else ("Знаменник" if mode == "even" else "Обидва")
-
     async with aiohttp.ClientSession() as session:
+        current_parity = await fetch_site_week_parity(session)
         main_data = await fetch_json(session, MAIN_API_URL)
         elective_data = await fetch_json(session, ELECTIVE_API_URL)
+
+    current_parity_str = parity_name(current_parity)
+    selected_parity_str = "Чисельник" if mode == "odd" else ("Знаменник" if mode == "even" else "Обидва")
 
     real_group_name = main_data.get("name", group_name)
     main_lessons = main_data.get("days", {}).get(day_slug, {}).get("lessons", [])
@@ -183,15 +246,15 @@ async def build_schedule_text(group_name: str, day_slug: str, day_title: str, mo
     return "\n".join(lines).strip(), valid_lessons
 
 async def build_full_week_text(mode: str) -> str:
-    current_parity = get_week_parity(datetime.now().date())
-    current_parity_str = parity_name(current_parity)
-    selected_parity_str = parity_name(mode)
     separator = "_________________________________\n"
 
     async with aiohttp.ClientSession() as session:
+        current_parity = await fetch_site_week_parity(session)
         main_data = await fetch_json(session, MAIN_API_URL)
         elective_data = await fetch_json(session, ELECTIVE_API_URL)
 
+    current_parity_str = parity_name(current_parity)
+    selected_parity_str = parity_name(mode)
     real_group_name = main_data.get("name", "Ветеринарна медицина ВМ-2023010 с.т.")
     days_dict = main_data.get("days", {})
     elective_dict = elective_data.get("days", {})
@@ -253,7 +316,9 @@ async def cmd_start(msg: types.Message):
 @dp.message(F.text == "📍 На сьогодні")
 async def today_schedule(msg: types.Message):
     today = datetime.now().date()
-    current_parity_str = parity_name(get_week_parity(today))
+    async with aiohttp.ClientSession() as session:
+        current_parity = await fetch_site_week_parity(session)
+    current_parity_str = parity_name(current_parity)
     day_idx = today.weekday()
 
     if day_idx in (5, 6):
@@ -266,16 +331,18 @@ async def today_schedule(msg: types.Message):
         return
 
     slug, day_title = WEEKDAYS_MAP[day_idx]
-    parity = get_week_parity(today)
-    text, _ = await build_schedule_text("Ветеринарна медицина ВМ-2023010 с.т.", slug, day_title, parity)
-    await msg.answer(text, reply_markup=get_inline_day_keyboard(parity, slug))
+    text, _ = await build_schedule_text("Ветеринарна медицина ВМ-2023010 с.т.", slug, day_title, current_parity)
+    await msg.answer(text, reply_markup=get_inline_day_keyboard(current_parity, slug))
 
 @dp.message(F.text == "➡️ На завтра")
 async def tomorrow_schedule(msg: types.Message):
     now_date = datetime.now().date()
-    current_parity_str = parity_name(get_week_parity(now_date))
     tomorrow = now_date + timedelta(days=1)
     day_idx = tomorrow.weekday()
+
+    async with aiohttp.ClientSession() as session:
+        current_parity = await fetch_site_week_parity(session)
+    current_parity_str = parity_name(current_parity)
 
     if day_idx in (5, 6):
         await msg.answer(
@@ -286,14 +353,17 @@ async def tomorrow_schedule(msg: types.Message):
         )
         return
 
+    # Якщо завтра понеділок (новий тиждень) — інвертуємо тиждень
+    tomorrow_parity = ("even" if current_parity == "odd" else "odd") if tomorrow.weekday() == 0 else current_parity
+
     slug, day_title = WEEKDAYS_MAP[day_idx]
-    parity = get_week_parity(tomorrow)
-    text, _ = await build_schedule_text("Ветеринарна медицина ВМ-2023010 с.т.", slug, day_title, parity)
-    await msg.answer(text, reply_markup=get_inline_day_keyboard(parity, slug))
+    text, _ = await build_schedule_text("Ветеринарна медицина ВМ-2023010 с.т.", slug, day_title, tomorrow_parity)
+    await msg.answer(text, reply_markup=get_inline_day_keyboard(tomorrow_parity, slug))
 
 @dp.message(F.text == "📅 Розклад")
 async def full_schedule(msg: types.Message):
-    current_parity = get_week_parity(datetime.now().date())
+    async with aiohttp.ClientSession() as session:
+        current_parity = await fetch_site_week_parity(session)
     text = await build_full_week_text(current_parity)
     await msg.answer(text, reply_markup=get_inline_week_keyboard(current_parity))
 
@@ -349,22 +419,25 @@ async def notifier_loop():
             today = now.date()
             current_time = now.time()
 
+            async with aiohttp.ClientSession() as session:
+                current_parity = await fetch_site_week_parity(session)
+
             # 1. Вечірнє повідомлення на завтра о 20:00
             if current_time.hour == 20 and current_time.minute == 0:
                 if evening_notified_date != today:
                     if today.weekday() not in (4, 5):
                         tomorrow = today + timedelta(days=1)
                         slug, day_title = WEEKDAYS_MAP[tomorrow.weekday()]
-                        parity = get_week_parity(tomorrow)
+                        tomorrow_parity = ("even" if current_parity == "odd" else "odd") if tomorrow.weekday() == 0 else current_parity
                         text, lessons = await build_schedule_text(
-                            "Ветеринарна медицина ВМ-2023010 с.т.", slug, day_title, parity
+                            "Ветеринарна медицина ВМ-2023010 с.т.", slug, day_title, tomorrow_parity
                         )
                         if lessons:
                             msg_text = f"📢 Розклад на завтра:\n\n{text}"
                             for chat_id in list(subscribers):
                                 try:
                                     await bot.send_message(
-                                        chat_id, msg_text, reply_markup=get_inline_day_keyboard(parity, slug)
+                                        chat_id, msg_text, reply_markup=get_inline_day_keyboard(tomorrow_parity, slug)
                                     )
                                 except Exception:
                                     pass
@@ -376,8 +449,7 @@ async def notifier_loop():
             # 2. Сповіщення за 20 хвилин до початку кожної пари
             if today.weekday() not in (5, 6):
                 slug, day_title = WEEKDAYS_MAP[today.weekday()]
-                parity = get_week_parity(today)
-                _, lessons = await build_schedule_text("", slug, day_title, parity)
+                _, lessons = await build_schedule_text("", slug, day_title, current_parity)
 
                 for l in lessons:
                     slot = l["timeSlot"]
