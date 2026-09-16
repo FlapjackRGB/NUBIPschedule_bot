@@ -6,16 +6,21 @@ from datetime import datetime, date, timedelta, time
 import aiohttp
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from aiogram.enums import ParseMode
+from aiogram.types import (
+    ReplyKeyboardMarkup, 
+    KeyboardButton, 
+    InlineKeyboardMarkup, 
+    InlineKeyboardButton, 
+    CallbackQuery
+)
 
-TOKEN = "8703800816:AAH5c8PSbXalv_1HmJ7gx8quwCCKnxKRyrk"
+TOKEN = ("8703800816:AAH5c8PSbXalv_1HmJ7gx8quwCCKnxKRyrk")
 
 MAIN_API_URL = "https://rozklad.nubip.edu.ua/api/public/schedule/VETM/3-10"
 ELECTIVE_API_URL = "https://rozklad.nubip.edu.ua/api/public/schedule/ADDT/0-8"
 SUBSCRIBERS_FILE = "subscribers.json"
 
-# Пари по 80 хв, перерви 20 хв
+# Пари по 80 хв (1:20), перерви по 20 хв
 BELL_TIMES = {
     1: {"start": time(8, 30),  "end": time(9, 50),  "str": "08:30 – 09:50"},
     2: {"start": time(10, 10), "end": time(11, 30), "str": "10:10 – 11:30"},
@@ -39,7 +44,7 @@ WEEKDAYS_MAP = {
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# ----------------- ПІДПИСНИКИ -----------------
+# ----------------- ПІДПИСНИКИ СПОВІЩЕНЬ -----------------
 
 def load_subscribers() -> set:
     if os.path.exists(SUBSCRIBERS_FILE):
@@ -83,7 +88,7 @@ def get_inline_parity_keyboard(current_mode: str, day_slug: str):
         ]
     )
 
-# ----------------- ОБРОБКА ДАНИХ ТА API -----------------
+# ----------------- ПАРСИНГ ТА ЗАПИТИ ДО API -----------------
 
 def parse_electives(raw_html: str) -> list[str]:
     items = re.split(r'<br\s*/?>', raw_html)
@@ -104,11 +109,11 @@ async def fetch_json(session: aiohttp.ClientSession, url: str) -> dict:
             if resp.status == 200:
                 return await resp.json()
     except Exception as e:
-        print(f"Помилка отримання даних: {e}")
+        print(f"Помилка запиту до API ({url}): {e}")
     return {}
 
 async def build_schedule_text(group_name: str, day_slug: str, day_title: str, mode: str) -> tuple[str, list]:
-    parity_str = "Чисельник" if mode == "odd" else ("Знаменник" if mode == "even" else "Чисельник / Знаменник")
+    parity_str = "Чисельник" if mode == "odd" else ("Знаменник" if mode == "even" else "Обидва")
 
     async with aiohttp.ClientSession() as session:
         main_data = await fetch_json(session, MAIN_API_URL)
@@ -140,7 +145,6 @@ async def build_schedule_text(group_name: str, day_slug: str, day_title: str, mo
 
     valid_lessons.sort(key=lambda x: x["timeSlot"])
 
-    # Форматування тексту як на вашому знімку екрана
     lines = [
         f"📚 {real_group_name}",
         f"Тиждень: {parity_str}",
@@ -159,12 +163,12 @@ async def build_schedule_text(group_name: str, day_slug: str, day_title: str, mo
 
     return "\n".join(lines).strip(), valid_lessons
 
-# ----------------- ХЕНДЛЕРИ ДІЙ ТА КНОПОК -----------------
+# ----------------- ХЕНДЛЕРИ КОРИСТУВАЧА -----------------
 
 @dp.message(Command("start"))
 async def cmd_start(msg: types.Message):
     await msg.answer(
-        "👋 Вітаю! Я бот розкладу для групи ВЕТМ 3-10.\nОберіть потрібний пункт:",
+        "👋 Вітаю! Я бот розкладу для групи ВЕТМ 3-10.\nОберіть потрібний пункт у меню нижче:",
         reply_markup=get_main_keyboard(msg.chat.id)
     )
 
@@ -233,7 +237,6 @@ async def denominator_full(msg: types.Message):
 @dp.callback_query(F.data.startswith("switch:"))
 async def switch_inline_mode(call: CallbackQuery):
     _, slug, mode = call.data.split(":")
-    # Пошук назви дня
     day_title = next(title for s, title in WEEKDAYS_MAP.values() if s == slug)
     text, _ = await build_schedule_text("Ветеринарна медицина ВМ-2023010 с.т.", slug, day_title, mode)
 
@@ -255,12 +258,12 @@ async def toggle_subscription(msg: types.Message):
         save_subscribers(subscribers)
         await msg.answer(
             "🔔 Сповіщення увімкнено!\n\n"
-            "• Розклад на завтра щовечора о 20:00 (у неділю–четвер)\n"
+            "• Розклад на завтра о 20:00 (у неділю–четвер)\n"
             "• Нагадування за 20 хвилин до початку кожної пари",
             reply_markup=get_main_keyboard(chat_id)
         )
 
-# ----------------- ФОНОВІ СПОВІЩЕННЯ -----------------
+# ----------------- СИСТЕМА СПОВІЩЕНЬ -----------------
 
 async def notifier_loop():
     notified_slots_today = set()
@@ -272,9 +275,10 @@ async def notifier_loop():
             today = now.date()
             current_time = now.time()
 
-            # 1. Вечірнє повідомлення на завтра о 20:00
+            # 1. Вечірній розклад на завтра о 20:00
             if current_time.hour == 20 and current_time.minute == 0:
                 if evening_notified_date != today:
+                    # Якщо сьогодні п'ятниця (4) або субота (5), завтра вихідний — не спамимо
                     if today.weekday() not in (4, 5):
                         tomorrow = today + timedelta(days=1)
                         slug, day_title = WEEKDAYS_MAP[tomorrow.weekday()]
@@ -293,10 +297,11 @@ async def notifier_loop():
                                     pass
                     evening_notified_date = today
 
+            # Очищення відміток відправлених пар опівночі
             if current_time.hour == 0 and current_time.minute == 1:
                 notified_slots_today.clear()
 
-            # 2. Сповіщення за 20 хвилин до кожної пари
+            # 2. Сповіщення за 20 хвилин до початку кожної пари (пн–пт)
             if today.weekday() not in (5, 6):
                 slug, day_title = WEEKDAYS_MAP[today.weekday()]
                 parity = get_week_parity(today)
@@ -312,6 +317,7 @@ async def notifier_loop():
                         lesson_dt = datetime.combine(today, start_time)
                         diff = (lesson_dt - now).total_seconds()
 
+                        # Вікно спрацювання: за 19–20 хвилин до початку
                         if 1140 <= diff <= 1260:
                             time_str = BELL_TIMES[slot]["str"]
                             alert_text = (
@@ -327,11 +333,11 @@ async def notifier_loop():
                             notified_slots_today.add(slot)
 
         except Exception as e:
-            print(f"Помилка в notifier_loop: {e}")
+            print(f"Помилка у циклі сповіщень: {e}")
 
         await asyncio.sleep(25)
 
-# ----------------- СТАРТ -----------------
+# ----------------- ТОЧКА ВХОДУ -----------------
 
 async def main():
     asyncio.create_task(notifier_loop())
