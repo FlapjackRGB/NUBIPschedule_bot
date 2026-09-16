@@ -15,7 +15,7 @@ MAIN_API_URL = "https://rozklad.nubip.edu.ua/api/public/schedule/VETM/3-10"
 ELECTIVE_API_URL = "https://rozklad.nubip.edu.ua/api/public/schedule/ADDT/0-8"
 SUBSCRIBERS_FILE = "subscribers.json"
 
-# Пари по 80 хв (1 год 20 хв), перерви 20 хв
+# Пари по 80 хв, перерви 20 хв
 BELL_TIMES = {
     1: {"start": time(8, 30),  "end": time(9, 50),  "str": "08:30 – 09:50"},
     2: {"start": time(10, 10), "end": time(11, 30), "str": "10:10 – 11:30"},
@@ -39,7 +39,7 @@ WEEKDAYS_MAP = {
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# ----------------- ПІДПИСНИКИ СПОВІЩЕНЬ -----------------
+# ----------------- ПІДПИСНИКИ -----------------
 
 def load_subscribers() -> set:
     if os.path.exists(SUBSCRIBERS_FILE):
@@ -59,7 +59,6 @@ subscribers = load_subscribers()
 def get_keyboard(chat_id: int):
     is_subbed = chat_id in subscribers
     sub_text = "🔕 Вимкнути сповіщення" if is_subbed else "🔔 Увімкнути сповіщення"
-    
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📍 На сьогодні"), KeyboardButton(text="➡️ На завтра")],
@@ -71,10 +70,15 @@ def get_keyboard(chat_id: int):
 
 # ----------------- ОБРОБКА ДАНИХ ТА API -----------------
 
-def clean_html(raw_html: str) -> str:
-    cleared = re.sub(r'<br\s*/?>', '\n   ▫️ ', raw_html)
-    cleared = re.sub(r'<.*?>', '', cleared)
-    return cleared.strip()
+def parse_electives(raw_html: str) -> list[str]:
+    # Розбиваємо HTML-теги перенесення рядків на окремі предмети
+    items = re.split(r'<br\s*/?>', raw_html)
+    cleaned = []
+    for item in items:
+        text = re.sub(r'<.*?>', '', item).strip()
+        if text and text not in cleaned:
+            cleaned.append(text)
+    return cleaned
 
 def get_week_parity(target_date: date) -> str:
     week_num = target_date.isocalendar()[1]
@@ -86,15 +90,30 @@ async def fetch_json(session: aiohttp.ClientSession, url: str) -> dict:
             if resp.status == 200:
                 return await resp.json()
     except Exception as e:
-        print(f"Помилка запиту до {url}: {e}")
+        print(f"Помилка отримання даних з {url}: {e}")
     return {}
+
+def format_day_lessons(day_title: str, lessons: list) -> str:
+    lines = [f"🗓️ {day_title}:\n"]
+    if not lessons:
+        lines.append("  ◽ Пар немає\n")
+        return "\n".join(lines)
+
+    for item in lessons:
+        slot = item["timeSlot"]
+        time_str = BELL_TIMES.get(slot, {}).get("str", "Час невідомий")
+        lines.append(f"{slot} пара 🕒 {time_str}")
+        lines.append(f"  ◽ {item['subject']}\n")
+
+    return "\n".join(lines)
 
 async def get_schedule_for_date(target_date: date) -> tuple[str, list]:
     day_idx = target_date.weekday()
-    if day_idx in (5, 6):
-        return f"📅 <b>{WEEKDAYS_MAP[day_idx][1]}</b> ({target_date.strftime('%d.%m.%Y')}):\n\nВихідний день! Пар немає 🎉", []
-
     slug, day_title = WEEKDAYS_MAP[day_idx]
+
+    if day_idx in (5, 6):
+        return f"🗓️ {day_title} ({target_date.strftime('%d.%m.%Y')}):\n\n  ◽ Вихідний день! Пар немає 🎉", []
+
     parity = get_week_parity(target_date)
     parity_ua = "Чисельник" if parity == "odd" else "Знаменник"
 
@@ -108,47 +127,42 @@ async def get_schedule_for_date(target_date: date) -> tuple[str, list]:
     valid_lessons = []
     for l in main_lessons:
         on_week = l.get("onWeek", "all")
-        if on_week == "all" or on_week == parity:
+        if on_week in ("all", parity):
             slot = l.get("timeSlot")
             subject = l.get("subject", "").strip()
 
-            if "вибором" in subject.lower() or "посилання" in subject.lower():
-                electives_matched = [
-                    clean_html(e.get("subject", ""))
-                    for e in elective_lessons
-                    if e.get("timeSlot") == slot and (e.get("onWeek") in ("all", parity))
-                ]
-                if electives_matched:
-                    subject = "<b>Вибіркова дисципліна:</b>\n   ▫️ " + "\n   ▫️ ".join(electives_matched)
+            # Заміна посилань на розпарсені вибіркові дисципліни
+            if "вибором" in subject.lower() or "розклад" in subject.lower() or "http" in subject.lower():
+                matched_electives = []
+                for e in elective_lessons:
+                    if e.get("timeSlot") == slot and e.get("onWeek") in ("all", parity):
+                        matched_electives.extend(parse_electives(e.get("subject", "")))
+                
+                if matched_electives:
+                    subject = "Вибіркова дисципліна:\n     " + "\n     ".join(f"• {sub}" for sub in matched_electives)
+                else:
+                    subject = "Дисципліни за вибором студента"
 
-            valid_lessons.append({
-                "timeSlot": slot,
-                "subject": subject
-            })
+            valid_lessons.append({"timeSlot": slot, "subject": subject})
 
     valid_lessons.sort(key=lambda x: x["timeSlot"])
 
-    if not valid_lessons:
-        return f"📅 <b>{day_title}</b> ({target_date.strftime('%d.%m.%Y')}) — <i>{parity_ua}</i>\n\nПар немає 🏖", []
+    header = f"Тиждень: {parity_ua} ({target_date.strftime('%d.%m.%Y')})\n_________________________________\n\n"
+    body = format_day_lessons(day_title, valid_lessons)
+    return header + body, valid_lessons
 
-    text_lines = [f"📅 <b>{day_title}</b> ({target_date.strftime('%d.%m.%Y')}) — <i>{parity_ua}</i>\n"]
-    for l in valid_lessons:
-        slot = l["timeSlot"]
-        time_str = BELL_TIMES.get(slot, {}).get("str", "Час не визначено")
-        text_lines.append(f"<b>{slot} пара</b> 🕒 <code>{time_str}</code>\n▫️ {l['subject']}\n")
-
-    return "\n".join(text_lines), valid_lessons
-
-async def get_schedule_by_type(target_parity: str) -> str:
+async def get_full_week_schedule(target_parity: str) -> str:
     parity_ua = "Чисельник" if target_parity == "odd" else "Знаменник"
-    
+    separator = "_________________________________\n"
+
     async with aiohttp.ClientSession() as session:
         main_data = await fetch_json(session, MAIN_API_URL)
         elective_data = await fetch_json(session, ELECTIVE_API_URL)
 
     days_dict = main_data.get("days", {})
     elective_dict = elective_data.get("days", {})
-    output = [f"📚 <b>Повний розклад: {parity_ua}</b>\n"]
+
+    output = [f"Тиждень: {parity_ua}\n{separator}"]
 
     for i in range(5):
         slug, title = WEEKDAYS_MAP[i]
@@ -162,59 +176,55 @@ async def get_schedule_by_type(target_parity: str) -> str:
                 slot = l.get("timeSlot")
                 subject = l.get("subject", "").strip()
 
-                if "вибором" in subject.lower() or "посилання" in subject.lower():
-                    matched = [
-                        clean_html(e.get("subject", ""))
-                        for e in day_electives
-                        if e.get("timeSlot") == slot and e.get("onWeek") in ("all", target_parity)
-                    ]
-                    if matched:
-                        subject = "<b>Вибіркова дисципліна:</b>\n   ▫️ " + "\n   ▫️ ".join(matched)
+                if "вибором" in subject.lower() or "розклад" in subject.lower() or "http" in subject.lower():
+                    matched_electives = []
+                    for e in day_electives:
+                        if e.get("timeSlot") == slot and e.get("onWeek") in ("all", target_parity):
+                            matched_electives.extend(parse_electives(e.get("subject", "")))
+                    
+                    if matched_electives:
+                        subject = "Вибіркова дисципліна:\n     " + "\n     ".join(f"• {sub}" for sub in matched_electives)
+                    else:
+                        subject = "Дисципліни за вибором студента"
 
                 valid.append({"timeSlot": slot, "subject": subject})
 
         valid.sort(key=lambda x: x["timeSlot"])
-        output.append(f"▫️ <b>{title}</b>:")
-        if valid:
-            for item in valid:
-                t = BELL_TIMES.get(item['timeSlot'], {}).get('str', '')
-                output.append(f"  <b>{item['timeSlot']} пара</b> ({t}):\n  {item['subject']}")
-        else:
-            output.append("  Пар немає")
-        output.append("")
+        output.append(format_day_lessons(title, valid))
+        if i < 4:
+            output.append(separator)
 
     return "\n".join(output)
 
-# ----------------- ХЕНДЛЕРИ КОМАНД ТА КНОПОК -----------------
+# ----------------- ОБРОБКА КОМАНД -----------------
 
 @dp.message(Command("start"))
 async def cmd_start(msg: types.Message):
     await msg.answer(
-        "👋 Вітаю! Я бот розкладу для групи <b>ВЕТМ 3-10</b>.\n\nОберіть потрібну дію:",
-        reply_markup=get_keyboard(msg.chat.id),
-        parse_mode=ParseMode.HTML
+        "👋 Вітаю! Я бот розкладу для групи ВЕТМ 3-10.\n\nОберіть потрібний пункт у меню:",
+        reply_markup=get_keyboard(msg.chat.id)
     )
 
 @dp.message(F.text == "📍 На сьогодні")
 async def today_schedule(msg: types.Message):
     text, _ = await get_schedule_for_date(datetime.now().date())
-    await msg.answer(text, parse_mode=ParseMode.HTML)
+    await msg.answer(text)
 
 @dp.message(F.text == "➡️ На завтра")
 async def tomorrow_schedule(msg: types.Message):
     tomorrow = datetime.now().date() + timedelta(days=1)
     text, _ = await get_schedule_for_date(tomorrow)
-    await msg.answer(text, parse_mode=ParseMode.HTML)
+    await msg.answer(text)
 
 @dp.message(F.text == "📅 Чисельник")
 async def numerator_schedule(msg: types.Message):
-    text = await get_schedule_by_type("odd")
-    await msg.answer(text, parse_mode=ParseMode.HTML)
+    text = await get_full_week_schedule("odd")
+    await msg.answer(text)
 
 @dp.message(F.text == "📅 Знаменник")
 async def denominator_schedule(msg: types.Message):
-    text = await get_schedule_by_type("even")
-    await msg.answer(text, parse_mode=ParseMode.HTML)
+    text = await get_full_week_schedule("even")
+    await msg.answer(text)
 
 @dp.message(F.text.in_(["🔔 Увімкнути сповіщення", "🔕 Вимкнути сповіщення"]))
 async def toggle_subscription(msg: types.Message):
@@ -222,19 +232,18 @@ async def toggle_subscription(msg: types.Message):
     if chat_id in subscribers:
         subscribers.remove(chat_id)
         save_subscribers(subscribers)
-        await msg.answer("🔕 Сповіщення <b>вимкнено</b>.", reply_markup=get_keyboard(chat_id), parse_mode=ParseMode.HTML)
+        await msg.answer("🔕 Сповіщення вимкнено.", reply_markup=get_keyboard(chat_id))
     else:
         subscribers.add(chat_id)
         save_subscribers(subscribers)
         await msg.answer(
-            "🔔 Сповіщення <b>увімкнено</b>!\n\n"
-            "• Розклад на наступний день о 20:00 (у неділю–четвер)\n"
+            "🔔 Сповіщення увімкнено!\n\n"
+            "• Розклад на завтра щодня о 20:00 (у неділю–четвер)\n"
             "• Нагадування за 20 хвилин до початку кожної пари",
-            reply_markup=get_keyboard(chat_id),
-            parse_mode=ParseMode.HTML
+            reply_markup=get_keyboard(chat_id)
         )
 
-# ----------------- ФОНОВА СЛУЖБА СПОВІЩЕНЬ -----------------
+# ----------------- АВТОМАТИЧНІ ОПОВІЩЕННЯ -----------------
 
 async def notifier_loop():
     notified_slots_today = set()
@@ -246,26 +255,26 @@ async def notifier_loop():
             today = now.date()
             current_time = now.time()
 
-            # 1. Вечірній розклад на завтра о 20:00 (крім п'ятниці 4 та суботи 5)
+            # 1. Вечірній розклад на завтра о 20:00 (крім пт і сб)
             if current_time.hour == 20 and current_time.minute == 0:
                 if evening_notified_date != today:
                     if today.weekday() not in (4, 5):
                         tomorrow = today + timedelta(days=1)
                         text, lessons = await get_schedule_for_date(tomorrow)
                         if lessons:
-                            msg_text = f"📢 <b>Розклад на завтра:</b>\n\n{text}"
+                            msg_text = f"📢 Розклад на завтра:\n\n{text}"
                             for chat_id in list(subscribers):
                                 try:
-                                    await bot.send_message(chat_id, msg_text, parse_mode=ParseMode.HTML)
+                                    await bot.send_message(chat_id, msg_text)
                                 except Exception:
                                     pass
                     evening_notified_date = today
 
-            # Очищення відміток пар опівночі
+            # Скидання лічильника пар опівночі
             if current_time.hour == 0 and current_time.minute == 1:
                 notified_slots_today.clear()
 
-            # 2. Сповіщення за 20 хвилин до початку пари (пн–пт)
+            # 2. Оповіщення за 20 хв до початку пари
             if today.weekday() not in (5, 6):
                 _, lessons = await get_schedule_for_date(today)
                 for l in lessons:
@@ -278,27 +287,26 @@ async def notifier_loop():
                         lesson_dt = datetime.combine(today, start_time)
                         diff = (lesson_dt - now).total_seconds()
 
-                        # Вікно спрацювання: за 19–20 хвилин до початку
                         if 1140 <= diff <= 1260:
                             time_str = BELL_TIMES[slot]["str"]
                             alert_text = (
-                                f"⏳ <b>Через 20 хвилин пара!</b>\n\n"
-                                f"<b>{slot} пара</b> (<code>{time_str}</code>)\n"
-                                f"▫️ {l['subject']}"
+                                f"⏳ Через 20 хвилин пара!\n\n"
+                                f"{slot} пара 🕒 {time_str}\n"
+                                f"  ◽ {l['subject']}"
                             )
                             for chat_id in list(subscribers):
                                 try:
-                                    await bot.send_message(chat_id, alert_text, parse_mode=ParseMode.HTML)
+                                    await bot.send_message(chat_id, alert_text)
                                 except Exception:
                                     pass
                             notified_slots_today.add(slot)
 
         except Exception as e:
-            print(f"Помилка у циклі сповіщень: {e}")
+            print(f"Помилка в notifier_loop: {e}")
 
         await asyncio.sleep(25)
 
-# ----------------- ГОЛОВНИЙ ЗАПУСК -----------------
+# ----------------- ТОЧКА ВХОДУ -----------------
 
 async def main():
     asyncio.create_task(notifier_loop())
