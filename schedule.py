@@ -67,13 +67,13 @@ def get_main_keyboard(chat_id: int):
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📍 На сьогодні"), KeyboardButton(text="➡️ На завтра")],
-            [KeyboardButton(text="📅 Чисельник"), KeyboardButton(text="📅 Знаменник")],
+            [KeyboardButton(text="📅 Розклад")],
             [KeyboardButton(text=sub_text)]
         ],
         resize_keyboard=True
     )
 
-def get_inline_parity_keyboard(current_mode: str, day_slug: str):
+def get_inline_day_keyboard(current_mode: str, day_slug: str):
     btn_odd = "🔘 Чисельник" if current_mode == "odd" else "Чисельник"
     btn_even = "🔘 Знаменник" if current_mode == "even" else "Знаменник"
     btn_all = "🔘 Обидва" if current_mode == "all" else "Обидва"
@@ -81,9 +81,22 @@ def get_inline_parity_keyboard(current_mode: str, day_slug: str):
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text=btn_odd, callback_data=f"switch:{day_slug}:odd"),
-                InlineKeyboardButton(text=btn_even, callback_data=f"switch:{day_slug}:even"),
-                InlineKeyboardButton(text=btn_all, callback_data=f"switch:{day_slug}:all")
+                InlineKeyboardButton(text=btn_odd, callback_data=f"switch_day:{day_slug}:odd"),
+                InlineKeyboardButton(text=btn_even, callback_data=f"switch_day:{day_slug}:even"),
+                InlineKeyboardButton(text=btn_all, callback_data=f"switch_day:{day_slug}:all")
+            ]
+        ]
+    )
+
+def get_inline_week_keyboard(current_mode: str):
+    btn_odd = "🔘 Чисельник" if current_mode == "odd" else "Чисельник"
+    btn_even = "🔘 Знаменник" if current_mode == "even" else "Знаменник"
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=btn_odd, callback_data="switch_week:odd"),
+                InlineKeyboardButton(text=btn_even, callback_data="switch_week:even")
             ]
         ]
     )
@@ -103,6 +116,9 @@ def get_week_parity(target_date: date) -> str:
     week_num = target_date.isocalendar()[1]
     return "even" if week_num % 2 == 0 else "odd"
 
+def parity_name(parity_code: str) -> str:
+    return "Чисельник" if parity_code == "odd" else "Знаменник"
+
 async def fetch_json(session: aiohttp.ClientSession, url: str) -> dict:
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -113,7 +129,9 @@ async def fetch_json(session: aiohttp.ClientSession, url: str) -> dict:
     return {}
 
 async def build_schedule_text(group_name: str, day_slug: str, day_title: str, mode: str) -> tuple[str, list]:
-    parity_str = "Чисельник" if mode == "odd" else ("Знаменник" if mode == "even" else "Обидва")
+    current_parity = get_week_parity(datetime.now().date())
+    current_parity_str = parity_name(current_parity)
+    selected_parity_str = "Чисельник" if mode == "odd" else ("Знаменник" if mode == "even" else "Обидва")
 
     async with aiohttp.ClientSession() as session:
         main_data = await fetch_json(session, MAIN_API_URL)
@@ -147,7 +165,8 @@ async def build_schedule_text(group_name: str, day_slug: str, day_title: str, mo
 
     lines = [
         f"📚 {real_group_name}",
-        f"Тиждень: {parity_str}",
+        f"Поточний тиждень: {current_parity_str}",
+        f"Відображено: {selected_parity_str}",
         "_________________________________\n",
         f"🗓️ {day_title}:\n"
     ]
@@ -163,6 +182,65 @@ async def build_schedule_text(group_name: str, day_slug: str, day_title: str, mo
 
     return "\n".join(lines).strip(), valid_lessons
 
+async def build_full_week_text(mode: str) -> str:
+    current_parity = get_week_parity(datetime.now().date())
+    current_parity_str = parity_name(current_parity)
+    selected_parity_str = parity_name(mode)
+    separator = "_________________________________\n"
+
+    async with aiohttp.ClientSession() as session:
+        main_data = await fetch_json(session, MAIN_API_URL)
+        elective_data = await fetch_json(session, ELECTIVE_API_URL)
+
+    real_group_name = main_data.get("name", "Ветеринарна медицина ВМ-2023010 с.т.")
+    days_dict = main_data.get("days", {})
+    elective_dict = elective_data.get("days", {})
+
+    output = [
+        f"📚 {real_group_name}",
+        f"Поточний тиждень: {current_parity_str}",
+        f"Відображено: {selected_parity_str}",
+        separator
+    ]
+
+    for i in range(5):
+        slug, title = WEEKDAYS_MAP[i]
+        day_lessons = days_dict.get(slug, {}).get("lessons", [])
+        day_electives = elective_dict.get(slug, {}).get("lessons", [])
+
+        valid = []
+        for l in day_lessons:
+            on_week = l.get("onWeek", "all")
+            if on_week in ("all", mode):
+                slot = l.get("timeSlot")
+                subject = l.get("subject", "").strip()
+
+                if "вибором" in subject.lower() or "посилання" in subject.lower() or "http" in subject.lower():
+                    matched = []
+                    for e in day_electives:
+                        if e.get("timeSlot") == slot and e.get("onWeek") in ("all", mode):
+                            matched.extend(parse_electives(e.get("subject", "")))
+                    if matched:
+                        subject = "Дисципліни за вибором:\n" + "\n".join(f"     • {sub}" for sub in matched)
+                    else:
+                        subject = "Дисципліни за вибором студента"
+
+                valid.append({"timeSlot": slot, "subject": subject})
+
+        valid.sort(key=lambda x: x["timeSlot"])
+        output.append(f"🗓️ {title}:\n")
+        if valid:
+            for item in valid:
+                t = BELL_TIMES.get(item['timeSlot'], {}).get('str', '')
+                output.append(f"{item['timeSlot']} пара 🕒 {t}\n  ◽ {item['subject']}\n")
+        else:
+            output.append("  ◽ Пар немає\n")
+
+        if i < 4:
+            output.append(separator)
+
+    return "\n".join(output)
+
 # ----------------- ХЕНДЛЕРИ КОРИСТУВАЧА -----------------
 
 @dp.message(Command("start"))
@@ -175,73 +253,69 @@ async def cmd_start(msg: types.Message):
 @dp.message(F.text == "📍 На сьогодні")
 async def today_schedule(msg: types.Message):
     today = datetime.now().date()
+    current_parity_str = parity_name(get_week_parity(today))
     day_idx = today.weekday()
+
     if day_idx in (5, 6):
-        await msg.answer(f"🗓️ {WEEKDAYS_MAP[day_idx][1]}:\n\n  ◽ Вихідний день! Пар немає 🎉")
+        await msg.answer(
+            f"📚 Ветеринарна медицина ВМ-2023010 с.т.\n"
+            f"Поточний тиждень: {current_parity_str}\n"
+            f"_________________________________\n\n"
+            f"🗓️ {WEEKDAYS_MAP[day_idx][1]}:\n\n  ◽ Вихідний день! Пар немає 🎉"
+        )
         return
 
     slug, day_title = WEEKDAYS_MAP[day_idx]
     parity = get_week_parity(today)
     text, _ = await build_schedule_text("Ветеринарна медицина ВМ-2023010 с.т.", slug, day_title, parity)
-    await msg.answer(text, reply_markup=get_inline_parity_keyboard(parity, slug))
+    await msg.answer(text, reply_markup=get_inline_day_keyboard(parity, slug))
 
 @dp.message(F.text == "➡️ На завтра")
 async def tomorrow_schedule(msg: types.Message):
-    tomorrow = datetime.now().date() + timedelta(days=1)
+    now_date = datetime.now().date()
+    current_parity_str = parity_name(get_week_parity(now_date))
+    tomorrow = now_date + timedelta(days=1)
     day_idx = tomorrow.weekday()
+
     if day_idx in (5, 6):
-        await msg.answer(f"🗓️ {WEEKDAYS_MAP[day_idx][1]}:\n\n  ◽ Вихідний день! Пар немає 🎉")
+        await msg.answer(
+            f"📚 Ветеринарна медицина ВМ-2023010 с.т.\n"
+            f"Поточний тиждень: {current_parity_str}\n"
+            f"_________________________________\n\n"
+            f"🗓️ {WEEKDAYS_MAP[day_idx][1]}:\n\n  ◽ Вихідний день! Пар немає 🎉"
+        )
         return
 
     slug, day_title = WEEKDAYS_MAP[day_idx]
     parity = get_week_parity(tomorrow)
     text, _ = await build_schedule_text("Ветеринарна медицина ВМ-2023010 с.т.", slug, day_title, parity)
-    await msg.answer(text, reply_markup=get_inline_parity_keyboard(parity, slug))
+    await msg.answer(text, reply_markup=get_inline_day_keyboard(parity, slug))
 
-@dp.message(F.text == "📅 Чисельник")
-async def numerator_full(msg: types.Message):
-    separator = "_________________________________\n"
-    output = ["📚 Ветеринарна медицина ВМ-2023010 с.т.\nТиждень: Чисельник\n" + separator]
-    for i in range(5):
-        slug, title = WEEKDAYS_MAP[i]
-        _, lessons = await build_schedule_text("", slug, title, "odd")
-        output.append(f"🗓️ {title}:\n")
-        if lessons:
-            for l in lessons:
-                t = BELL_TIMES.get(l['timeSlot'], {}).get('str', '')
-                output.append(f"{l['timeSlot']} пара 🕒 {t}\n  ◽ {l['subject']}\n")
-        else:
-            output.append("  ◽ Пар немає\n")
-        if i < 4:
-            output.append(separator)
-    await msg.answer("\n".join(output))
+@dp.message(F.text == "📅 Розклад")
+async def full_schedule(msg: types.Message):
+    current_parity = get_week_parity(datetime.now().date())
+    text = await build_full_week_text(current_parity)
+    await msg.answer(text, reply_markup=get_inline_week_keyboard(current_parity))
 
-@dp.message(F.text == "📅 Знаменник")
-async def denominator_full(msg: types.Message):
-    separator = "_________________________________\n"
-    output = ["📚 Ветеринарна медицина ВМ-2023010 с.т.\nТиждень: Знаменник\n" + separator]
-    for i in range(5):
-        slug, title = WEEKDAYS_MAP[i]
-        _, lessons = await build_schedule_text("", slug, title, "even")
-        output.append(f"🗓️ {title}:\n")
-        if lessons:
-            for l in lessons:
-                t = BELL_TIMES.get(l['timeSlot'], {}).get('str', '')
-                output.append(f"{l['timeSlot']} пара 🕒 {t}\n  ◽ {l['subject']}\n")
-        else:
-            output.append("  ◽ Пар немає\n")
-        if i < 4:
-            output.append(separator)
-    await msg.answer("\n".join(output))
-
-@dp.callback_query(F.data.startswith("switch:"))
-async def switch_inline_mode(call: CallbackQuery):
+@dp.callback_query(F.data.startswith("switch_day:"))
+async def switch_inline_day(call: CallbackQuery):
     _, slug, mode = call.data.split(":")
     day_title = next(title for s, title in WEEKDAYS_MAP.values() if s == slug)
     text, _ = await build_schedule_text("Ветеринарна медицина ВМ-2023010 с.т.", slug, day_title, mode)
 
     try:
-        await call.message.edit_text(text, reply_markup=get_inline_parity_keyboard(mode, slug))
+        await call.message.edit_text(text, reply_markup=get_inline_day_keyboard(mode, slug))
+    except Exception:
+        pass
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("switch_week:"))
+async def switch_inline_week(call: CallbackQuery):
+    _, mode = call.data.split(":")
+    text = await build_full_week_text(mode)
+
+    try:
+        await call.message.edit_text(text, reply_markup=get_inline_week_keyboard(mode))
     except Exception:
         pass
     await call.answer()
@@ -275,10 +349,9 @@ async def notifier_loop():
             today = now.date()
             current_time = now.time()
 
-            # 1. Вечірній розклад на завтра о 20:00
+            # 1. Вечірнє повідомлення на завтра о 20:00
             if current_time.hour == 20 and current_time.minute == 0:
                 if evening_notified_date != today:
-                    # Якщо сьогодні п'ятниця (4) або субота (5), завтра вихідний — не спамимо
                     if today.weekday() not in (4, 5):
                         tomorrow = today + timedelta(days=1)
                         slug, day_title = WEEKDAYS_MAP[tomorrow.weekday()]
@@ -291,17 +364,16 @@ async def notifier_loop():
                             for chat_id in list(subscribers):
                                 try:
                                     await bot.send_message(
-                                        chat_id, msg_text, reply_markup=get_inline_parity_keyboard(parity, slug)
+                                        chat_id, msg_text, reply_markup=get_inline_day_keyboard(parity, slug)
                                     )
                                 except Exception:
                                     pass
                     evening_notified_date = today
 
-            # Очищення відміток відправлених пар опівночі
             if current_time.hour == 0 and current_time.minute == 1:
                 notified_slots_today.clear()
 
-            # 2. Сповіщення за 20 хвилин до початку кожної пари (пн–пт)
+            # 2. Сповіщення за 20 хвилин до початку кожної пари
             if today.weekday() not in (5, 6):
                 slug, day_title = WEEKDAYS_MAP[today.weekday()]
                 parity = get_week_parity(today)
@@ -317,7 +389,6 @@ async def notifier_loop():
                         lesson_dt = datetime.combine(today, start_time)
                         diff = (lesson_dt - now).total_seconds()
 
-                        # Вікно спрацювання: за 19–20 хвилин до початку
                         if 1140 <= diff <= 1260:
                             time_str = BELL_TIMES[slot]["str"]
                             alert_text = (
