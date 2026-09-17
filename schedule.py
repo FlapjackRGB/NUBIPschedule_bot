@@ -17,7 +17,7 @@ from aiogram.types import (
 
 TOKEN = ("8703800816:AAH5c8PSbXalv_1HmJ7gx8quwCCKnxKRyrk")
 
-# Фіксація часового поясу Києва для коректної роботи на серверах у будь-якій країні
+# Фіксація часового поясу Києва
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
 MAIN_API_URL = "https://rozklad.nubip.edu.ua/api/public/schedule/VETM/3-10"
@@ -49,29 +49,39 @@ WEEKDAYS_MAP = {
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# Кеш для поточного тижня з сайту (оновлюється раз на 30 хвилин)
 CACHED_PARITY = {"parity": None, "timestamp": 0}
 
-# ----------------- ПІДПИСНИКИ СПОВІЩЕНЬ -----------------
+# ----------------- ПІДПИСНИКИ (ПІДТРИМКА ГІЛОК/ФОРУМІВ) -----------------
 
-def load_subscribers() -> set:
+def load_subscribers() -> list[dict]:
+    """Завантажує підписників: зберігає {chat_id: int, thread_id: int|None}"""
     if os.path.exists(SUBSCRIBERS_FILE):
         try:
             with open(SUBSCRIBERS_FILE, "r", encoding="utf-8") as f:
-                return set(json.load(f))
+                data = json.load(f)
+                # Конвертація старих числових chat_id, якщо такі збереглися
+                sub_list = []
+                for item in data:
+                    if isinstance(item, int):
+                        sub_list.append({"chat_id": item, "thread_id": None})
+                    elif isinstance(item, dict) and "chat_id" in item:
+                        sub_list.append(item)
+                return sub_list
         except Exception:
-            return set()
-    return set()
+            return []
+    return []
 
-def save_subscribers(subs: set):
+def save_subscribers(subs: list[dict]):
     with open(SUBSCRIBERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(list(subs), f)
+        json.dump(subs, f, ensure_ascii=False, indent=2)
 
 subscribers = load_subscribers()
 
-def get_main_keyboard(chat_id: int):
-    is_subbed = chat_id in subscribers
-    sub_text = "🔕 Вимкнути сповіщення" if is_subbed else "🔔 Увімкнути сповіщення"
+def is_subscribed(chat_id: int, thread_id: int | None) -> bool:
+    return any(s["chat_id"] == chat_id and s.get("thread_id") == thread_id for s in subscribers)
+
+def get_main_keyboard(chat_id: int, thread_id: int | None = None):
+    sub_text = "🔕 Вимкнути сповіщення" if is_subscribed(chat_id, thread_id) else "🔔 Увімкнути сповіщення"
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📍 На сьогодні"), KeyboardButton(text="➡️ На завтра")],
@@ -311,10 +321,16 @@ async def build_full_week_text(mode: str) -> str:
 @dp.message(Command("start"))
 async def cmd_start(msg: types.Message):
     await msg.answer(
-        "👋 Вітаю! Я бот розкладу для групи ВЕТМ 3-10.\nОберіть потрібний пункт у меню нижче:",
-        reply_markup=get_main_keyboard(msg.chat.id)
+        "👋 Вітаю! Я бот розкладу для групи ВЕТМ 3-10.\n"
+        "Оберіть дію в меню або скористайтеся командами:\n"
+        "• /today — розклад на сьогодні\n"
+        "• /tomorrow — розклад на завтра\n"
+        "• /schedule — розклад на весь тиждень\n"
+        "• /subscribe — увімкнути/вимкнути сповіщення для цього чату/гілки",
+        reply_markup=get_main_keyboard(msg.chat.id, msg.message_thread_id)
     )
 
+@dp.message(Command("today"))
 @dp.message(F.text == "📍 На сьогодні")
 async def today_schedule(msg: types.Message):
     today = datetime.now(KYIV_TZ).date()
@@ -336,6 +352,7 @@ async def today_schedule(msg: types.Message):
     text, _ = await build_schedule_text("Ветеринарна медицина ВМ-2023010 с.т.", slug, day_title, current_parity)
     await msg.answer(text, reply_markup=get_inline_day_keyboard(current_parity, slug))
 
+@dp.message(Command("tomorrow"))
 @dp.message(F.text == "➡️ На завтра")
 async def tomorrow_schedule(msg: types.Message):
     now_date = datetime.now(KYIV_TZ).date()
@@ -361,6 +378,7 @@ async def tomorrow_schedule(msg: types.Message):
     text, _ = await build_schedule_text("Ветеринарна медицина ВМ-2023010 с.т.", slug, day_title, tomorrow_parity)
     await msg.answer(text, reply_markup=get_inline_day_keyboard(tomorrow_parity, slug))
 
+@dp.message(Command("schedule"))
 @dp.message(F.text == "📅 Розклад")
 async def full_schedule(msg: types.Message):
     async with aiohttp.ClientSession() as session:
@@ -391,21 +409,26 @@ async def switch_inline_week(call: CallbackQuery):
         pass
     await call.answer()
 
+@dp.message(Command("subscribe"))
 @dp.message(F.text.in_(["🔔 Увімкнути сповіщення", "🔕 Вимкнути сповіщення"]))
 async def toggle_subscription(msg: types.Message):
+    global subscribers
     chat_id = msg.chat.id
-    if chat_id in subscribers:
-        subscribers.remove(chat_id)
+    thread_id = msg.message_thread_id  # Автоматично підхоплює ID поточної гілки/топіка
+
+    if is_subscribed(chat_id, thread_id):
+        subscribers = [s for s in subscribers if not (s["chat_id"] == chat_id and s.get("thread_id") == thread_id)]
         save_subscribers(subscribers)
-        await msg.answer("🔕 Сповіщення вимкнено.", reply_markup=get_main_keyboard(chat_id))
+        await msg.answer("🔕 Сповіщення <b>вимкнено</b> для цього чату/гілки.", parse_mode="HTML")
     else:
-        subscribers.add(chat_id)
+        subscribers.append({"chat_id": chat_id, "thread_id": thread_id})
         save_subscribers(subscribers)
+        place = f"цій закритій гілці (ID: {thread_id})" if thread_id else "цьому чаті"
         await msg.answer(
-            "🔔 Сповіщення увімкнено!\n\n"
+            f"🔔 Сповіщення <b>увімкнено</b> у {place}!\n\n"
             "• Розклад на завтра о 20:00 (у неділю–четвер)\n"
             "• Нагадування за 20 хвилин до початку кожної пари",
-            reply_markup=get_main_keyboard(chat_id)
+            parse_mode="HTML"
         )
 
 # ----------------- СИСТЕМА СПОВІЩЕНЬ -----------------
@@ -416,7 +439,6 @@ async def notifier_loop():
 
     while True:
         try:
-            # Отримуємо точний час за Києвом
             now = datetime.now(KYIV_TZ)
             today = now.date()
             current_time = now.time()
@@ -424,10 +446,9 @@ async def notifier_loop():
             async with aiohttp.ClientSession() as session:
                 current_parity = await fetch_site_week_parity(session)
 
-            # 1. Вечірнє повідомлення на завтра о 20:00 за Києвом
+            # 1. Вечірнє повідомлення на завтра о 20:00 (крім пт і сб)
             if current_time.hour == 20 and current_time.minute == 0:
                 if evening_notified_date != today:
-                    # У п'ятницю (4) і суботу (5) сповіщення не надсилаються
                     if today.weekday() not in (4, 5):
                         tomorrow = today + timedelta(days=1)
                         slug, day_title = WEEKDAYS_MAP[tomorrow.weekday()]
@@ -437,16 +458,18 @@ async def notifier_loop():
                         )
                         if lessons:
                             msg_text = f"📢 Розклад на завтра:\n\n{text}"
-                            for chat_id in list(subscribers):
+                            for sub in list(subscribers):
                                 try:
                                     await bot.send_message(
-                                        chat_id, msg_text, reply_markup=get_inline_day_keyboard(tomorrow_parity, slug)
+                                        chat_id=sub["chat_id"],
+                                        text=msg_text,
+                                        message_thread_id=sub.get("thread_id"),
+                                        reply_markup=get_inline_day_keyboard(tomorrow_parity, slug)
                                     )
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    print(f"Помилка відправки в {sub}: {e}")
                     evening_notified_date = today
 
-            # Скидання лічильника пар на початку нової доби за Києвом
             if current_time.hour == 0 and current_time.minute == 1:
                 notified_slots_today.clear()
 
@@ -462,11 +485,9 @@ async def notifier_loop():
 
                     start_time = BELL_TIMES.get(slot, {}).get("start")
                     if start_time:
-                        # Створюємо дату початку пари з київським часовим поясом
                         lesson_dt = datetime.combine(today, start_time, tzinfo=KYIV_TZ)
                         diff = (lesson_dt - now).total_seconds()
 
-                        # Спрацьовує за 19–20 хвилин до початку пари
                         if 1140 <= diff <= 1260:
                             time_str = BELL_TIMES[slot]["str"]
                             alert_text = (
@@ -474,11 +495,15 @@ async def notifier_loop():
                                 f"{slot} пара 🕒 {time_str}\n"
                                 f"  ◽ {l['subject']}"
                             )
-                            for chat_id in list(subscribers):
+                            for sub in list(subscribers):
                                 try:
-                                    await bot.send_message(chat_id, alert_text)
-                                except Exception:
-                                    pass
+                                    await bot.send_message(
+                                        chat_id=sub["chat_id"],
+                                        text=alert_text,
+                                        message_thread_id=sub.get("thread_id")
+                                    )
+                                except Exception as e:
+                                    print(f"Помилка відправки в {sub}: {e}")
                             notified_slots_today.add(slot)
 
         except Exception as e:
