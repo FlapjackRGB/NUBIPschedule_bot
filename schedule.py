@@ -12,12 +12,13 @@ from aiogram.types import (
     KeyboardButton, 
     InlineKeyboardMarkup, 
     InlineKeyboardButton, 
-    CallbackQuery
+    CallbackQuery,
+    ReplyKeyboardRemove
 )
 
 TOKEN = ("8703800816:AAH5c8PSbXalv_1HmJ7gx8quwCCKnxKRyrk")
 
-# Фіксація часового поясу Києва
+# Фіксація точного часового поясу Києва
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
 MAIN_API_URL = "https://rozklad.nubip.edu.ua/api/public/schedule/VETM/3-10"
@@ -54,12 +55,11 @@ CACHED_PARITY = {"parity": None, "timestamp": 0}
 # ----------------- ПІДПИСНИКИ (ПІДТРИМКА ГІЛОК/ФОРУМІВ) -----------------
 
 def load_subscribers() -> list[dict]:
-    """Завантажує підписників: зберігає {chat_id: int, thread_id: int|None}"""
+    """Завантажує підписників: {chat_id: int, thread_id: int|None}"""
     if os.path.exists(SUBSCRIBERS_FILE):
         try:
             with open(SUBSCRIBERS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                # Конвертація старих числових chat_id, якщо такі збереглися
                 sub_list = []
                 for item in data:
                     if isinstance(item, int):
@@ -81,7 +81,8 @@ def is_subscribed(chat_id: int, thread_id: int | None) -> bool:
     return any(s["chat_id"] == chat_id and s.get("thread_id") == thread_id for s in subscribers)
 
 def get_main_keyboard(chat_id: int, thread_id: int | None = None):
-    sub_text = "🔕 Вимкнути сповіщення" if is_subscribed(chat_id, thread_id) else "🔔 Увімкнути сповіщення"
+    is_sub = is_subscribed(chat_id, thread_id)
+    sub_text = "🔕 Вимкнути сповіщення" if is_sub else "🔔 Увімкнути сповіщення"
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📍 На сьогодні"), KeyboardButton(text="➡️ На завтра")],
@@ -320,15 +321,28 @@ async def build_full_week_text(mode: str) -> str:
 
 @dp.message(Command("start"))
 async def cmd_start(msg: types.Message):
-    await msg.answer(
-        "👋 Вітаю! Я бот розкладу для групи ВЕТМ 3-10.\n"
-        "Оберіть дію в меню або скористайтеся командами:\n"
-        "• /today — розклад на сьогодні\n"
-        "• /tomorrow — розклад на завтра\n"
-        "• /schedule — розклад на весь тиждень\n"
-        "• /subscribe — увімкнути/вимкнути сповіщення для цього чату/гілки",
-        reply_markup=get_main_keyboard(msg.chat.id, msg.message_thread_id)
-    )
+    # У групі або топіку прибираємо нижню клавіатуру, щоб не захаращувати екран
+    if msg.chat.type in ("group", "supergroup"):
+        await msg.answer(
+            "👋 Бот розкладу для ВЕТМ 3-10 підключено до групи.\n\n"
+            "Доступні команди:\n"
+            "• /today — розклад на сьогодні\n"
+            "• /tomorrow — на завтра\n"
+            "• /schedule — на весь тиждень\n"
+            "• /subscribe — увімкнути/вимкнути автосповіщення в цій гілці (лише для адмінів)",
+            reply_markup=ReplyKeyboardRemove()
+        )
+    else:
+        # В особистих повідомленнях клавіатура відображається
+        await msg.answer(
+            "👋 Вітаю! Я бот розкладу для групи ВЕТМ 3-10.\n"
+            "Оберіть потрібний пункт у меню або скористайтеся командами:\n"
+            "• /today — на сьогодні\n"
+            "• /tomorrow — на завтра\n"
+            "• /schedule — повний тиждень\n"
+            "• /subscribe — налаштування сповіщень",
+            reply_markup=get_main_keyboard(msg.chat.id, msg.message_thread_id)
+        )
 
 @dp.message(Command("today"))
 @dp.message(F.text == "📍 На сьогодні")
@@ -414,7 +428,14 @@ async def switch_inline_week(call: CallbackQuery):
 async def toggle_subscription(msg: types.Message):
     global subscribers
     chat_id = msg.chat.id
-    thread_id = msg.message_thread_id  # Автоматично підхоплює ID поточної гілки/топіка
+    thread_id = msg.message_thread_id
+
+    # Захист: у групі керувати сповіщеннями може тільки адміністратор або творець чату
+    if msg.chat.type in ("group", "supergroup"):
+        member = await msg.chat.get_member(msg.from_user.id)
+        if member.status not in ("creator", "administrator"):
+            await msg.answer("⚠️ Тільки адміністратор групи може змінювати налаштування сповіщень!")
+            return
 
     if is_subscribed(chat_id, thread_id):
         subscribers = [s for s in subscribers if not (s["chat_id"] == chat_id and s.get("thread_id") == thread_id)]
@@ -446,7 +467,7 @@ async def notifier_loop():
             async with aiohttp.ClientSession() as session:
                 current_parity = await fetch_site_week_parity(session)
 
-            # 1. Вечірнє повідомлення на завтра о 20:00 (крім пт і сб)
+            # 1. Вечірнє повідомлення на завтра о 20:00 за Києвом (крім пт і сб)
             if current_time.hour == 20 and current_time.minute == 0:
                 if evening_notified_date != today:
                     if today.weekday() not in (4, 5):
@@ -470,6 +491,7 @@ async def notifier_loop():
                                     print(f"Помилка відправки в {sub}: {e}")
                     evening_notified_date = today
 
+            # Очищення списку відправлених пар опівночі за Києвом
             if current_time.hour == 0 and current_time.minute == 1:
                 notified_slots_today.clear()
 
@@ -488,6 +510,7 @@ async def notifier_loop():
                         lesson_dt = datetime.combine(today, start_time, tzinfo=KYIV_TZ)
                         diff = (lesson_dt - now).total_seconds()
 
+                        # Спрацьовує за 19–20 хвилин до дзвінка
                         if 1140 <= diff <= 1260:
                             time_str = BELL_TIMES[slot]["str"]
                             alert_text = (
